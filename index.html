@@ -392,31 +392,81 @@ async function iniciarBusca(){
       var resp = await fetch('/buscar-dou?data=' + encodeURIComponent(dataStr));
       if(resp.ok){
         var json = await resp.json();
-        (json.publicacoes || []).forEach(function(pub){
-          var uid = pub.titulo + pub.empresa + pub.data;
-          if(vistos[uid]) return;
-          vistos[uid] = true;
-          todos.push({
-            titulo:           pub.titulo   || 'Publicacao ANVISA',
-            empresa:          pub.empresa  || '',
-            cnpj:             pub.cnpj     || '',
-            tipoAto:          fmtTipo(pub.tipo),
-            slug:             slugTipo(pub.tipo),
-            codigo:           pub.codigo_ato || '',
-            processo:         pub.numero_processo || '',
-            registro:         pub.numero_registro || '',
-            categoria:        pub.categoria || '',
-            resumo:           pub.resumo   || '',
-            link:             pub.link     || 'https://www.in.gov.br/consulta',
-            data:             pub.data     || dataStr,
-            alerta:           checkAlerta(pub.titulo+' '+(pub.empresa||'')),
-            // campos para salvar no Sheets
-            numero_processo:  pub.numero_processo || '',
-            numero_registro:  pub.numero_registro || '',
-            dias_analise:     pub.dias_analise || null,
-            tipo:             pub.tipo || ''
-          });
-        });
+        var resolucoes = json.publicacoes || [];
+
+        // Para cada resolução encontrada, extrair os processos individuais via Claude
+        for(var j = 0; j < resolucoes.length; j++){
+          var pub = resolucoes[j];
+          var link = pub.link || '';
+
+          // Só processar links válidos do DOU
+          if(!link || !link.startsWith('https://www.in.gov.br')) {
+            // fallback: adicionar a resolução como item único
+            var uid = pub.titulo + pub.empresa + pub.data;
+            if(!vistos[uid]){
+              vistos[uid] = true;
+              todos.push(montarItem(pub, dataStr));
+            }
+            continue;
+          }
+
+          showLoading('Extraindo processos de ' + dataStr + ' — resolução ' + (j+1) + '/' + resolucoes.length + '...');
+
+          try {
+            var extResp = await fetch('/api/extrair-processos', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ link: link, data: dataStr })
+            });
+
+            if(extResp.ok){
+              var extJson = await extResp.json();
+              var processos = extJson.processos || [];
+
+              if(processos.length > 0){
+                processos.forEach(function(p){
+                  var uid = (p.numero_processo || '') + (p.produto || '');
+                  if(vistos[uid]) return;
+                  vistos[uid] = true;
+                  todos.push({
+                    titulo:          p.produto    || pub.titulo || 'Processo ANVISA',
+                    empresa:         p.empresa    || '',
+                    cnpj:            '',
+                    tipoAto:         fmtTipo(p.tipo_ato),
+                    slug:            slugTipo(p.tipo_ato),
+                    categoria:       p.categoria  || '',
+                    resumo:          '',
+                    link:            link,
+                    data:            dataStr,
+                    alerta:          checkAlerta((p.empresa||'') + ' ' + (p.produto||'')),
+                    // campos estruturados para o Excel
+                    numero_processo: p.numero_processo || '',
+                    numero_registro: p.numero_registro || '',
+                    dias_analise:    p.dias_analise    || null,
+                    tipo:            p.tipo_ato        || '',
+                    tipo_processo:   p.tipo_processo   || '',
+                    exigencia:       p.exigencia       || '',
+                    desconsiderar:   p.desconsiderar   || 'Não',
+                  });
+                });
+              } else {
+                // Nenhum processo extraído — adicionar a resolução como item genérico
+                var uid2 = pub.titulo + dataStr;
+                if(!vistos[uid2]){ vistos[uid2]=true; todos.push(montarItem(pub, dataStr)); }
+              }
+            } else {
+              var uid3 = pub.titulo + dataStr;
+              if(!vistos[uid3]){ vistos[uid3]=true; todos.push(montarItem(pub, dataStr)); }
+            }
+          } catch(eExt){
+            console.warn('Erro ao extrair processos:', eExt);
+            var uid4 = pub.titulo + dataStr;
+            if(!vistos[uid4]){ vistos[uid4]=true; todos.push(montarItem(pub, dataStr)); }
+          }
+
+          // Pequena pausa para não sobrecarregar a API
+          await sleep(800);
+        }
       }
     } catch(e){ console.warn('Erro ao buscar ' + dataStr, e); }
 
@@ -576,6 +626,28 @@ function inferirExigencia(p){
   return '';
 }
 // ─────────────────────────────────────────────────────────────
+
+function montarItem(pub, dataStr){
+  return {
+    titulo:          pub.titulo   || 'Publicacao ANVISA',
+    empresa:         pub.empresa  || '',
+    cnpj:            pub.cnpj     || '',
+    tipoAto:         fmtTipo(pub.tipo),
+    slug:            slugTipo(pub.tipo),
+    categoria:       pub.categoria || '',
+    resumo:          pub.resumo   || '',
+    link:            pub.link     || 'https://www.in.gov.br/consulta',
+    data:            pub.data     || dataStr,
+    alerta:          checkAlerta(pub.titulo+' '+(pub.empresa||'')),
+    numero_processo: pub.numero_processo || '',
+    numero_registro: pub.numero_registro || '',
+    dias_analise:    pub.dias_analise    || null,
+    tipo:            pub.tipo            || '',
+    tipo_processo:   '',
+    exigencia:       '',
+    desconsiderar:   'Não',
+  };
+}
 
 function fmtTipo(t){
   t=(t||'').toLowerCase();

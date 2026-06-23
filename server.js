@@ -589,6 +589,156 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
+  // ── ROTA: extrair processos individuais de uma resolução ─────
+  if (req.url === "/api/extrair-processos" && req.method === "POST") {
+    if (!CHAVE) {
+      res.writeHead(500, {"Content-Type":"application/json"});
+      res.end(JSON.stringify({error:"Chave API não configurada"}));
+      return;
+    }
+
+    var body = "";
+    req.on("data", function(c) { body += c; });
+    req.on("end", function() {
+      var link, dataDOU;
+      try {
+        var parsed = JSON.parse(body);
+        link    = parsed.link;
+        dataDOU = parsed.data || "";
+      } catch(e) {
+        res.writeHead(400, {"Content-Type":"application/json"});
+        res.end(JSON.stringify({error:"JSON inválido"}));
+        return;
+      }
+
+      if (!link || !link.startsWith("https://www.in.gov.br")) {
+        res.writeHead(400, {"Content-Type":"application/json"});
+        res.end(JSON.stringify({error:"Link inválido"}));
+        return;
+      }
+
+      // 1. Buscar HTML da resolução
+      var urlObj = new URL(link);
+      var reqOpts = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + (urlObj.search || ""),
+        method: "GET",
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0",
+          "Accept": "text/html,application/xhtml+xml",
+          "Accept-Language": "pt-BR,pt;q=0.9",
+        }
+      };
+
+      var pageReq = https.request(reqOpts, function(pageRes) {
+        var chunks = [];
+        pageRes.on("data", function(c) { chunks.push(c); });
+        pageRes.on("end", function() {
+          var html = Buffer.concat(chunks).toString("utf8");
+
+          // 2. Extrair texto limpo do HTML (remover tags)
+          var texto = html
+            .replace(/<script[\s\S]*?<\/script>/gi, "")
+            .replace(/<style[\s\S]*?<\/style>/gi, "")
+            .replace(/<[^>]+>/g, " ")
+            .replace(/&nbsp;/g, " ")
+            .replace(/&amp;/g, "&")
+            .replace(/&lt;/g, "<")
+            .replace(/&gt;/g, ">")
+            .replace(/\s{2,}/g, "\n")
+            .trim()
+            .substring(0, 12000); // limitar para não estourar contexto
+
+          // 3. Mandar para o Claude extrair os processos
+          var prompt = "Você receberá o texto de uma Resolução-RE da ANVISA publicada no Diário Oficial da União.\n\n" +
+            "Extraia TODOS os processos de cosméticos/HPPC (higiene pessoal, perfumaria e cosméticos) listados.\n" +
+            "IGNORE processos de saneantes, medicamentos ou outros que não sejam cosméticos/HPPC.\n\n" +
+            "Para cada processo, extraia exatamente:\n" +
+            "- empresa: razão social completa\n" +
+            "- produto: nome do produto\n" +
+            "- numero_processo: formato 00000.000000/0000-00\n" +
+            "- numero_registro: número de 9 dígitos\n" +
+            "- tipo_ato: descrição do ato (ex: Registro de produtos cosméticos, Revalidação de Registro, etc)\n" +
+            "- tipo_processo: 'Registro Novo', 'Pós Registro Simplificado' ou 'Pós Registro Não Simplificado'\n" +
+            "- exigencia: 'Com Exigência', 'Sem Exigência' ou '' se não informado\n" +
+            "- categoria: 'Protetor Solar', 'Repelentes de Insetos', 'Gel Antisséptico', 'Alisantes Capilares', 'Pomadas Capilares' ou 'Cosméticos'\n" +
+            "- dias_analise: número inteiro de dias ou null se não informado\n" +
+            "- desconsiderar: 'Sim' se houver indicação de desconsiderar no cálculo, caso contrário 'Não'\n\n" +
+            "Responda SOMENTE com JSON válido, sem texto antes ou depois:\n" +
+            "{\"processos\": [...], \"total\": N, \"resolucao\": \"título da resolução\"}\n\n" +
+            "DATA DO DOU: " + dataDOU + "\n\n" +
+            "TEXTO DA RESOLUÇÃO:\n" + texto;
+
+          var payload = JSON.stringify({
+            model: "claude-sonnet-4-6",
+            max_tokens: 4096,
+            messages: [{ role: "user", content: prompt }]
+          });
+
+          var apiOpts = {
+            hostname: "api.anthropic.com",
+            path: "/v1/messages",
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": CHAVE,
+              "anthropic-version": "2023-06-01",
+              "Content-Length": Buffer.byteLength(payload)
+            }
+          };
+
+          var apiReq = https.request(apiOpts, function(apiRes) {
+            var dados = "";
+            apiRes.on("data", function(c) { dados += c; });
+            apiRes.on("end", function() {
+              try {
+                var resposta = JSON.parse(dados);
+                var texto_claude = (resposta.content && resposta.content[0] && resposta.content[0].text) || "{}";
+
+                // Extrair JSON da resposta
+                var inicio = texto_claude.indexOf("{");
+                var fim    = texto_claude.lastIndexOf("}") + 1;
+                var jsonStr = inicio >= 0 ? texto_claude.substring(inicio, fim) : "{}";
+                var resultado = JSON.parse(jsonStr);
+
+                // Adicionar data a cada processo
+                (resultado.processos || []).forEach(function(p) {
+                  p.data = dataDOU;
+                });
+
+                res.writeHead(200, {"Content-Type":"application/json"});
+                res.end(JSON.stringify(resultado));
+              } catch(e) {
+                console.error("Erro ao parsear resposta Claude:", e.message);
+                res.writeHead(500, {"Content-Type":"application/json"});
+                res.end(JSON.stringify({error:"Erro ao interpretar resposta: " + e.message, processos:[]}));
+              }
+            });
+          });
+
+          apiReq.on("error", function(e) {
+            res.writeHead(500, {"Content-Type":"application/json"});
+            res.end(JSON.stringify({error: e.message, processos:[]}));
+          });
+          apiReq.write(payload);
+          apiReq.end();
+        });
+      });
+
+      pageReq.on("error", function(e) {
+        res.writeHead(500, {"Content-Type":"application/json"});
+        res.end(JSON.stringify({error:"Erro ao buscar resolução: " + e.message, processos:[]}));
+      });
+      pageReq.setTimeout(25000, function() {
+        pageReq.destroy();
+        res.writeHead(500, {"Content-Type":"application/json"});
+        res.end(JSON.stringify({error:"Timeout ao buscar resolução", processos:[]}));
+      });
+      pageReq.end();
+    });
+    return;
+  }
+
   // ── Arquivos estáticos ───────────────────────────────────────
   servArquivo(res, path.join(__dirname, req.url === "/" ? "/index.html" : req.url));
 });
