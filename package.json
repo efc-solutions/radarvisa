@@ -1,7 +1,6 @@
 {
   "name": "radarvisa",
-  "version": "1.0.0",
-  "main": "server.js",
+  "version": "3.0.0",
   "scripts": {
     "start": "node server.js"
   }

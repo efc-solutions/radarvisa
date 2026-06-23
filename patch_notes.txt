@@ -1,0 +1,5 @@
+Changes to index.html:
+1. Add "Salvar no Sheets" button after the search button row
+2. Add salvarNoSheets() JavaScript function
+3. Add global ultimaBusca variable
+4. Set ultimaBusca after search completes

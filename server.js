@@ -6,6 +6,11 @@ const path  = require("path");
 const PORT  = process.env.PORT || 8080;
 const CHAVE = (process.env.ANTHROPIC_API_KEY || "").trim();
 
+// ── Variáveis Google Sheets (configurar no Render) ────────────
+// GOOGLE_SHEET_ID        → ID da planilha (entre /d/ e /edit na URL)
+// GOOGLE_SERVICE_ACCOUNT → conteúdo completo do arquivo JSON baixado do Google Cloud
+// ─────────────────────────────────────────────────────────────
+
 function servArquivo(res, filePath) {
   if (!fs.existsSync(filePath)) { res.writeHead(404); res.end("404"); return; }
   const tipos = { ".html":"text/html;charset=utf-8", ".js":"application/javascript", ".json":"application/json", ".css":"text/css" };
@@ -13,7 +18,7 @@ function servArquivo(res, filePath) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-// ── Busca o DOU e extrai jsonArray do script embutido ─────────
+// ── Busca o DOU ───────────────────────────────────────────────
 function buscarDOU(dataAPI, callback) {
   var opts = {
     hostname: "www.in.gov.br",
@@ -42,22 +47,12 @@ function buscarDOU(dataAPI, callback) {
   req.end();
 }
 
-// ── Extrai publicacoes ANVISA/HPPC do HTML ────────────────────
+// ── Extrai publicações ANVISA/HPPC do HTML ────────────────────
 function extrairPublicacoes(html, dataExib) {
   if (!html || html.length < 500) return [];
 
   var resultados = [];
   var vistos = {};
-
-  // Frases exatas que a ANVISA usa nas resolucoes de cosmeticos
-  var frasesExatas = [
-    "deferir os registros e as peticoes dos produtos de higiene pessoal, cosmeticos e perfumes",
-    "indeferir os registros e as peticoes dos produtos de higiene pessoal, cosmeticos e perfumes",
-    "cancelar os registros e as peticoes dos produtos de higiene pessoal, cosmeticos e perfumes",
-    "produtos de higiene pessoal, cosmeticos e perfumes",
-    "registro de produtos cosmeticos",
-    "reg. cosmeticos"
-  ];
 
   var termosHPPC = [
     "cosmet", "higiene pessoal", "perfum", "protetor solar",
@@ -67,38 +62,26 @@ function extrairPublicacoes(html, dataExib) {
     "hppc", "2731"
   ];
 
-  // Termos que EXCLUEM a publicacao (saneantes, medicamentos, etc)
   var termosExcluir = [
     "saneante", "medicamento", "farmaceutico", "dispositivo medico",
     "alimento", "agrotox", "fumigeno"
   ];
 
-  // Estrategia 1: extrai do script application/json (formato Next.js do DOU)
-  // O DOU injeta os dados em <script id="__NEXT_DATA__" type="application/json">
   var nextDataMatch = html.match(/<script[^>]*id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
   if (nextDataMatch) {
     try {
       var nextData = JSON.parse(nextDataMatch[1]);
-      // Navega pela estrutura do Next.js
       var props = nextData.props || {};
       var pageProps = props.pageProps || {};
       var items = pageProps.jsonArray || pageProps.items || pageProps.content || [];
-
       if (!Array.isArray(items) && pageProps.data) {
         items = pageProps.data.jsonArray || pageProps.data.items || [];
       }
-
       console.log("__NEXT_DATA__ encontrado, items:", items.length);
-
-      items.forEach(function(item) {
-        processar(item, dataExib, termosHPPC, vistos, resultados);
-      });
-    } catch(e) {
-      console.log("Erro __NEXT_DATA__:", e.message);
-    }
+      items.forEach(function(item) { processar(item, dataExib, termosHPPC, termosExcluir, vistos, resultados); });
+    } catch(e) { console.log("Erro __NEXT_DATA__:", e.message); }
   }
 
-  // Estrategia 2: procura jsonArray em qualquer script
   if (resultados.length === 0) {
     var scriptMatches = html.match(/<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/gi);
     if (scriptMatches) {
@@ -111,44 +94,27 @@ function extrairPublicacoes(html, dataExib) {
           if (Array.isArray(json)) items = json;
           else if (json.jsonArray) items = json.jsonArray;
           else if (json.items) items = json.items;
-
-          console.log("Script JSON encontrado, items:", items.length);
-          if (items.length > 0) {
-            var amostra = items[0];
-            console.log("AMOSTRA item[0] keys:", Object.keys(amostra).join(","));
-            console.log("AMOSTRA title:", (amostra.title || amostra.titulo || "SEM TITULO").substring(0,80));
-            console.log("AMOSTRA orgao:", (amostra.orgaoName || amostra.orgao || amostra.hierarchyStr || "SEM ORGAO").substring(0,80));
-          }
-          items.forEach(function(item) {
-            processar(item, dataExib, termosHPPC, vistos, resultados);
-          });
+          if (items.length > 0) console.log("Script JSON encontrado, items:", items.length);
+          items.forEach(function(item) { processar(item, dataExib, termosHPPC, termosExcluir, vistos, resultados); });
         } catch(e) {}
       });
     }
   }
 
-  // Estrategia 3: regex direto para encontrar jsonArray
   if (resultados.length === 0) {
     var jaMatch = html.match(/jsonArray["\s]*:\s*(\[[\s\S]{10,}\])/);
     if (jaMatch) {
       try {
-        // Limita o tamanho para evitar JSON invalido
         var jsonStr = jaMatch[1];
-        // Encontra o fim do array balanceando colchetes
-        var depth = 0;
-        var end = 0;
+        var depth = 0, end = 0;
         for (var i = 0; i < jsonStr.length; i++) {
           if (jsonStr[i] === "[") depth++;
           else if (jsonStr[i] === "]") { depth--; if (depth === 0) { end = i + 1; break; } }
         }
         var items = JSON.parse(jsonStr.substring(0, end));
         console.log("jsonArray regex, items:", items.length);
-        items.forEach(function(item) {
-          processar(item, dataExib, termosHPPC, vistos, resultados);
-        });
-      } catch(e) {
-        console.log("Erro jsonArray regex:", e.message.substring(0, 100));
-      }
+        items.forEach(function(item) { processar(item, dataExib, termosHPPC, termosExcluir, vistos, resultados); });
+      } catch(e) { console.log("Erro jsonArray regex:", e.message.substring(0, 100)); }
     }
   }
 
@@ -156,61 +122,41 @@ function extrairPublicacoes(html, dataExib) {
   return resultados;
 }
 
-function processar(item, dataExib, termosHPPC, vistos, resultados) {
+function processar(item, dataExib, termosHPPC, termosExcluir, vistos, resultados) {
   var titulo  = limpar(item.title || item.titulo || "");
   var resumo  = limpar(item.content || item.resumo || item.abstract || item.artBody || "");
-  // hierarchyStr e o campo correto do DOU: "Ministerio da Saude/Agencia Nacional de Vigilancia Sanitaria/..."
   var orgao   = (item.hierarchyStr || item.hierarchyList || item.orgaoName || item.orgao || "").toLowerCase();
   var urlTit  = item.urlTitle || item.slugify || "";
   var secao   = item.pubName || item.secao || "DO1";
 
-  // Filtra: precisa ser da ANVISA
   var textoCompleto = (titulo + " " + resumo + " " + orgao).toLowerCase()
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
   var ehAnvisa = textoCompleto.includes("anvisa") ||
                  textoCompleto.includes("vigilancia sanitaria") ||
                  textoCompleto.includes("agencia nacional de vigilancia");
   if (!ehAnvisa) return;
 
-  // LOG: mostra os primeiros 5 itens da ANVISA para debug
-  if (Object.keys(vistos).length < 5) {
-    console.log("ANVISA item titulo:", titulo.substring(0,80));
-    console.log("ANVISA item resumo:", resumo.substring(0,120));
-    console.log("ANVISA item orgao:", orgao.substring(0,80));
-  }
-
-  var textoNorm = textoCompleto.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  var textoNorm = textoCompleto;
   var orgaoNorm = orgao.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
 
-  // ESTRATEGIA PRINCIPAL: filtra pelo orgao/hierarquia
-  // A ANVISA tem setores especificos para cosmeticos:
-  // "gerencia geral de cosmeticos" ou "cosmeticos e saneantes"
   var ehCosmeticosPorOrgao =
-    orgaoNorm.includes("cosmeticos") ||
-    orgaoNorm.includes("cosmet") ||
-    orgaoNorm.includes("higiene pessoal") ||
-    orgaoNorm.includes("perfumaria");
+    orgaoNorm.includes("cosmeticos") || orgaoNorm.includes("cosmet") ||
+    orgaoNorm.includes("higiene pessoal") || orgaoNorm.includes("perfumaria");
 
-  // Exclui fumigenos (tabaco) mesmo que esteja na gerencia de cosmeticos/saneantes
   var ehFumigeno = textoNorm.includes("fumigeno") || textoNorm.includes("tabaco") || textoNorm.includes("cigarro");
   if (ehFumigeno) return;
 
-  // Exclui saneantes puros (sem cosmeticos)
   var ehSaneantesPuro = orgaoNorm.includes("saneante") && !orgaoNorm.includes("cosmet");
-
   var ehHPPC = ehCosmeticosPorOrgao && !ehSaneantesPuro;
 
-  // FALLBACK: se nao identificou pelo orgao, tenta pelo titulo/conteudo
   if (!ehHPPC) {
-    var ehHPPCPorTexto = frasesExatas.some(function(t) { return textoNorm.indexOf(t) !== -1; });
-    if (!ehHPPCPorTexto) ehHPPCPorTexto = termosHPPC.some(function(t) { return textoNorm.indexOf(t) !== -1; });
+    var ehHPPCPorTexto = termosHPPC.some(function(t) { return textoNorm.indexOf(t) !== -1; });
     if (!ehHPPCPorTexto) return;
-    // Exclui saneantes e fumigenos pelo texto
     var ehExcluido = termosExcluir.some(function(t) { return textoNorm.indexOf(t) !== -1; });
     if (ehExcluido) return;
   }
 
-  // Evita duplicatas
   var uid = urlTit || titulo.substring(0, 60);
   if (vistos[uid]) return;
   vistos[uid] = true;
@@ -220,14 +166,18 @@ function processar(item, dataExib, termosHPPC, vistos, resultados) {
     : "https://www.in.gov.br/consulta";
 
   resultados.push({
-    titulo:   titulo || "Publicacao ANVISA",
-    empresa:  extrairEmpresa(titulo + " " + resumo),
-    tipo:     classificar(titulo, resumo),
-    resumo:   resumo.substring(0, 400),
-    link:     link,
-    secao:    secao,
-    data:     dataExib,
-    orgao:    limpar(item.orgaoName || item.orgao || "ANVISA")
+    titulo:            titulo || "Publicacao ANVISA",
+    empresa:           extrairEmpresa(titulo + " " + resumo),
+    tipo:              classificar(titulo, resumo),
+    resumo:            resumo.substring(0, 400),
+    link:              link,
+    secao:             secao,
+    data:              dataExib,
+    orgao:             limpar(item.orgaoName || item.orgao || "ANVISA"),
+    numero_processo:   extrairProcesso(titulo + " " + resumo),
+    numero_registro:   extrairRegistro(titulo + " " + resumo),
+    dias_analise:      null,  // calculado pelo Claude via /api/claude se usado
+    categoria:         extrairCategoria(titulo + " " + resumo + " " + orgao)
   });
 }
 
@@ -240,15 +190,35 @@ function extrairEmpresa(texto) {
   return m ? m[1].trim().substring(0, 80) : "";
 }
 
+function extrairProcesso(texto) {
+  var m = texto.match(/\d{5}\.\d{6}\/\d{4}-\d{2}/);
+  return m ? m[0] : "";
+}
+
+function extrairRegistro(texto) {
+  var m = texto.match(/\b\d{9}\b/);
+  return m ? m[0] : "";
+}
+
+function extrairCategoria(texto) {
+  var t = texto.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  if (t.includes("protetor solar")) return "Protetor Solar";
+  if (t.includes("repelente")) return "Repelentes de Insetos";
+  if (t.includes("antissept") || t.includes("gel alcool")) return "Gel Antisséptico";
+  if (t.includes("alisante")) return "Alisantes Capilares";
+  if (t.includes("capilar") || t.includes("shampoo") || t.includes("xampu")) return "Capilar";
+  if (t.includes("maquiagem") || t.includes("batom") || t.includes("makeup")) return "Maquiagem";
+  if (t.includes("perfum")) return "Perfumaria";
+  if (t.includes("sabonete")) return "Sabonete";
+  if (t.includes("desodorante")) return "Desodorante";
+  return "Cosméticos";
+}
+
 function classificar(titulo, resumo) {
   var t = (titulo + " " + resumo).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-
-  // Usa as frases exatas da ANVISA primeiro
   if (t.includes("deferir os registros") && !t.includes("indeferir")) return "Deferimento";
   if (t.includes("indeferir os registros") || t.includes("indeferimento")) return "Indeferimento";
   if (t.includes("cancelar os registros") || t.includes("cancelamento")) return "Cancelamento";
-
-  // Fallback pelos codigos de ato
   if (t.includes("2731") || (t.includes("registro") && t.includes("concess"))) return "Deferimento";
   if (t.includes("238") || t.includes("revalida")) return "Revalidacao Automatica";
   if (t.includes("235")) return "Cancelamento";
@@ -256,37 +226,201 @@ function classificar(titulo, resumo) {
   if (t.includes("289") || t.includes("rotulagem")) return "Alteracao Rotulagem";
   if (t.includes("2112") || t.includes("inclusao")) return "Inclusao Apresentacao";
   if (t.includes("indeferid")) return "Indeferimento";
-
   return "Publicacao ANVISA";
 }
 
-// ── Servidor ──────────────────────────────────────────────────
+// ── Google Sheets: obter token JWT ───────────────────────────
+function getGoogleToken(callback) {
+  var sa;
+  try {
+    var raw = process.env.GOOGLE_SERVICE_ACCOUNT || "";
+    sa = JSON.parse(raw);
+  } catch(e) {
+    return callback(new Error("GOOGLE_SERVICE_ACCOUNT inválido: " + e.message));
+  }
+
+  // JWT header + payload
+  var header  = b64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
+  var now     = Math.floor(Date.now() / 1000);
+  var payload = b64url(JSON.stringify({
+    iss: sa.client_email,
+    scope: "https://www.googleapis.com/auth/spreadsheets",
+    aud: "https://oauth2.googleapis.com/token",
+    exp: now + 3600,
+    iat: now
+  }));
+
+  var unsigned = header + "." + payload;
+
+  // Assinar com a chave privada usando crypto nativo do Node
+  var crypto = require("crypto");
+  var sign   = crypto.createSign("SHA256");
+  sign.update(unsigned);
+  var signature;
+  try {
+    signature = sign.sign(sa.private_key, "base64")
+      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+  } catch(e) {
+    return callback(new Error("Erro ao assinar JWT: " + e.message));
+  }
+
+  var jwt = unsigned + "." + signature;
+
+  // Trocar JWT por access token
+  var body = "grant_type=" + encodeURIComponent("urn:ietf:params:oauth:grant-type:jwt-bearer") +
+             "&assertion=" + encodeURIComponent(jwt);
+
+  var req = https.request({
+    hostname: "oauth2.googleapis.com",
+    path: "/token",
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", "Content-Length": Buffer.byteLength(body) }
+  }, function(res) {
+    var data = "";
+    res.on("data", function(c) { data += c; });
+    res.on("end", function() {
+      try {
+        var json = JSON.parse(data);
+        if (!json.access_token) return callback(new Error("Token não retornado: " + data.substring(0, 200)));
+        callback(null, json.access_token);
+      } catch(e) { callback(new Error("Erro ao parsear token: " + e.message)); }
+    });
+  });
+  req.on("error", callback);
+  req.write(body);
+  req.end();
+}
+
+function b64url(str) {
+  return Buffer.from(str).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+}
+
+// ── Google Sheets: ler linhas existentes (coluna J = Nº Processo) ──
+function lerProcessosExistentes(token, sheetId, callback) {
+  var path = "/v4/spreadsheets/" + sheetId + "/values/DADOS!J:J";
+  var req = https.request({
+    hostname: "sheets.googleapis.com",
+    path: path,
+    method: "GET",
+    headers: { "Authorization": "Bearer " + token }
+  }, function(res) {
+    var data = "";
+    res.on("data", function(c) { data += c; });
+    res.on("end", function() {
+      try {
+        var json = JSON.parse(data);
+        var valores = (json.values || []).flat().filter(Boolean);
+        callback(null, valores);
+      } catch(e) { callback(new Error("Erro ao ler planilha: " + e.message)); }
+    });
+  });
+  req.on("error", callback);
+  req.end();
+}
+
+// ── Google Sheets: verificar/criar cabeçalho ─────────────────
+function garantirCabecalho(token, sheetId, callback) {
+  var path = "/v4/spreadsheets/" + sheetId + "/values/DADOS!A1:N1";
+  var req = https.request({
+    hostname: "sheets.googleapis.com",
+    path: path,
+    method: "GET",
+    headers: { "Authorization": "Bearer " + token }
+  }, function(res) {
+    var data = "";
+    res.on("data", function(c) { data += c; });
+    res.on("end", function() {
+      try {
+        var json = JSON.parse(data);
+        var temCabecalho = json.values && json.values.length > 0 && json.values[0].length > 0;
+        if (temCabecalho) return callback(null); // já existe
+
+        // Criar cabeçalho
+        var cabecalho = [[
+          "Data DOU", "Mês", "Ano", "Categoria", "Tipo de Ato",
+          "Tipo Processo", "Com/Sem Exigência", "Empresa", "Produto",
+          "Nº Processo", "Nº Registro", "Dias de Análise",
+          "Desconsiderar?", "Observação"
+        ]];
+
+        var body = JSON.stringify({ values: cabecalho });
+        var putPath = "/v4/spreadsheets/" + sheetId + "/values/DADOS!A1:N1?valueInputOption=RAW";
+        var putReq = https.request({
+          hostname: "sheets.googleapis.com",
+          path: putPath,
+          method: "PUT",
+          headers: {
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body)
+          }
+        }, function(putRes) {
+          var d = "";
+          putRes.on("data", function(c) { d += c; });
+          putRes.on("end", function() { callback(null); });
+        });
+        putReq.on("error", callback);
+        putReq.write(body);
+        putReq.end();
+      } catch(e) { callback(new Error("Erro ao verificar cabeçalho: " + e.message)); }
+    });
+  });
+  req.on("error", callback);
+  req.end();
+}
+
+// ── Google Sheets: adicionar linhas novas ─────────────────────
+function adicionarLinhas(token, sheetId, linhas, callback) {
+  var body = JSON.stringify({ values: linhas });
+  var path = "/v4/spreadsheets/" + sheetId + "/values/DADOS!A1:N1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS";
+
+  var req = https.request({
+    hostname: "sheets.googleapis.com",
+    path: "/v4/spreadsheets/" + sheetId + "/values/DADOS!A:N:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS",
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer " + token,
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body)
+    }
+  }, function(res) {
+    var data = "";
+    res.on("data", function(c) { data += c; });
+    res.on("end", function() {
+      try {
+        var json = JSON.parse(data);
+        callback(null, json);
+      } catch(e) { callback(new Error("Erro ao adicionar linhas: " + e.message)); }
+    });
+  });
+  req.on("error", callback);
+  req.write(body);
+  req.end();
+}
+
+// ── Servidor HTTP ─────────────────────────────────────────────
 const server = http.createServer(function(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
-  // Rota: busca direta no DOU
+  // ── ROTA: busca direta no DOU ────────────────────────────────
   if (req.url.startsWith("/buscar-dou") && req.method === "GET") {
     var qs = req.url.split("?")[1] || "";
     var params = {};
     qs.split("&").forEach(function(p) { var kv = p.split("="); params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1] || ""); });
-    var dataParam = params.data; // dd/MM/yyyy
-
+    var dataParam = params.data;
     if (!dataParam) { res.writeHead(400); res.end(JSON.stringify({error:"Parametro data obrigatorio"})); return; }
-
     var partes = dataParam.split("/");
-    var dataAPI = partes[0] + "-" + partes[1] + "-" + partes[2]; // dd-MM-yyyy
+    var dataAPI = partes[0] + "-" + partes[1] + "-" + partes[2];
 
     buscarDOU(dataAPI, function(err, html, status) {
       if (err || status !== 200) {
-        console.log("Erro DOU:", err ? err.message : "status " + status);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ publicacoes: [], total: 0, erro: err ? err.message : "status " + status }));
         return;
       }
-
       var pubs = extrairPublicacoes(html, dataParam);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ publicacoes: pubs, total: pubs.length, data: dataParam }));
@@ -294,7 +428,7 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
-  // Rota: proxy Claude
+  // ── ROTA: proxy Claude ───────────────────────────────────────
   if (req.url === "/api/claude" && req.method === "POST") {
     if (!CHAVE) { res.writeHead(500); res.end(JSON.stringify({error:"SEM_CHAVE"})); return; }
     let body = "";
@@ -314,7 +448,6 @@ const server = http.createServer(function(req, res) {
         let dados = "";
         apiRes.on("data", function(c) { dados += c; });
         apiRes.on("end", function() {
-          if (apiRes.statusCode !== 200) console.log("Erro Anthropic", apiRes.statusCode, dados.substring(0,200));
           res.writeHead(apiRes.statusCode, {"Content-Type":"application/json"});
           res.end(dados);
         });
@@ -325,10 +458,159 @@ const server = http.createServer(function(req, res) {
     return;
   }
 
+  // ── ROTA NOVA: salvar no Google Sheets ───────────────────────
+  if (req.url === "/api/salvar-sheets" && req.method === "POST") {
+    var sheetId = process.env.GOOGLE_SHEET_ID;
+    if (!sheetId) {
+      res.writeHead(500, {"Content-Type":"application/json"});
+      res.end(JSON.stringify({error:"GOOGLE_SHEET_ID não configurado no servidor."}));
+      return;
+    }
+    if (!process.env.GOOGLE_SERVICE_ACCOUNT) {
+      res.writeHead(500, {"Content-Type":"application/json"});
+      res.end(JSON.stringify({error:"GOOGLE_SERVICE_ACCOUNT não configurado no servidor."}));
+      return;
+    }
+
+    var body = "";
+    req.on("data", function(c) { body += c; });
+    req.on("end", function() {
+      var processos;
+      try { processos = JSON.parse(body).processos; } catch(e) {
+        res.writeHead(400, {"Content-Type":"application/json"});
+        res.end(JSON.stringify({error:"JSON inválido"}));
+        return;
+      }
+
+      if (!processos || processos.length === 0) {
+        res.writeHead(400, {"Content-Type":"application/json"});
+        res.end(JSON.stringify({error:"Nenhum processo enviado."}));
+        return;
+      }
+
+      console.log("Salvando " + processos.length + " processo(s) no Sheets...");
+
+      // 1. Obter token
+      getGoogleToken(function(err, token) {
+        if (err) {
+          console.error("Erro token:", err.message);
+          res.writeHead(500, {"Content-Type":"application/json"});
+          res.end(JSON.stringify({error:"Erro de autenticação Google: " + err.message}));
+          return;
+        }
+
+        // 2. Garantir cabeçalho
+        garantirCabecalho(token, sheetId, function(err) {
+          if (err) console.warn("Aviso cabeçalho:", err.message);
+
+          // 3. Ler processos já existentes (deduplicação)
+          lerProcessosExistentes(token, sheetId, function(err, existentes) {
+            if (err) { existentes = []; console.warn("Aviso leitura:", err.message); }
+
+            // 4. Filtrar apenas processos novos
+            var meses = ["Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+                         "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"];
+            var linhasNovas = [];
+            var duplicatas = 0;
+
+            processos.forEach(function(p) {
+              var numProc = p.numero_processo || p.processo || "";
+              // Deduplicação: pular se número de processo já existe
+              if (numProc && existentes.includes(numProc)) {
+                duplicatas++;
+                return;
+              }
+
+              // Montar a linha na mesma ordem do cabeçalho
+              var dataDOU = p.data || "";
+              var partes = dataDOU.split("/");
+              var mes = "", ano = "";
+              if (partes.length === 3) {
+                var idx = parseInt(partes[1], 10) - 1;
+                mes = meses[idx] || "";
+                ano = partes[2] || "";
+              }
+
+              var tipoAto  = p.tipo || p.tipoAto || "";
+              var tipoProc = inferirTipoProcesso(tipoAto);
+              var exigencia = inferirExigencia(tipoAto, tipoProc);
+
+              linhasNovas.push([
+                dataDOU,                          // A - Data DOU
+                mes,                              // B - Mês
+                ano,                              // C - Ano
+                p.categoria || "",                // D - Categoria
+                tipoAto,                          // E - Tipo de Ato
+                tipoProc,                         // F - Tipo Processo
+                exigencia,                        // G - Com/Sem Exigência
+                p.empresa || "",                  // H - Empresa
+                p.titulo || "",                   // I - Produto
+                numProc,                          // J - Nº Processo
+                p.numero_registro || p.registro || "", // K - Nº Registro
+                p.dias_analise || "",             // L - Dias de Análise
+                "Não",                            // M - Desconsiderar?
+                p.resumo ? p.resumo.substring(0, 200) : "" // N - Observação
+              ]);
+            });
+
+            if (linhasNovas.length === 0) {
+              res.writeHead(200, {"Content-Type":"application/json"});
+              res.end(JSON.stringify({
+                sucesso: true,
+                adicionados: 0,
+                duplicatas: duplicatas,
+                mensagem: "Todos os " + duplicatas + " processo(s) já existem na planilha."
+              }));
+              return;
+            }
+
+            // 5. Adicionar linhas novas
+            adicionarLinhas(token, sheetId, linhasNovas, function(err, resultado) {
+              if (err) {
+                console.error("Erro ao adicionar linhas:", err.message);
+                res.writeHead(500, {"Content-Type":"application/json"});
+                res.end(JSON.stringify({error:"Erro ao gravar na planilha: " + err.message}));
+                return;
+              }
+
+              console.log("✅ " + linhasNovas.length + " linha(s) adicionada(s). " + duplicatas + " duplicata(s) ignorada(s).");
+              res.writeHead(200, {"Content-Type":"application/json"});
+              res.end(JSON.stringify({
+                sucesso: true,
+                adicionados: linhasNovas.length,
+                duplicatas: duplicatas,
+                mensagem: linhasNovas.length + " processo(s) novo(s) salvo(s). " + duplicatas + " já existia(m)."
+              }));
+            });
+          });
+        });
+      });
+    });
+    return;
+  }
+
+  // ── Arquivos estáticos ───────────────────────────────────────
   servArquivo(res, path.join(__dirname, req.url === "/" ? "/index.html" : req.url));
 });
 
+// ── Helpers para inferir campos não disponíveis diretamente ──
+function inferirTipoProcesso(tipoAto) {
+  var t = (tipoAto || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  if (t.includes("deferimento") || t.includes("registro") || t.includes("concessao")) return "Registro Novo";
+  if (t.includes("inclusao") || t.includes("simplific")) return "Pós Registro Simplificado";
+  if (t.includes("revalid") || t.includes("alterac") || t.includes("modificac") || t.includes("rotulagem")) return "Pós Registro Não Simplificado";
+  if (t.includes("cancelamento")) return "Pós Registro Simplificado";
+  return "";
+}
+
+function inferirExigencia(tipoAto, tipoProc) {
+  if (tipoProc !== "Registro Novo") return ""; // só se aplica a Registro Novo
+  return ""; // não é possível inferir sem dados do DOU — campo fica em branco para preenchimento manual se necessário
+}
+
 server.listen(PORT, "0.0.0.0", function() {
   console.log("RadarVisa v3 na porta " + PORT);
-  console.log("Chave API: " + (CHAVE ? "OK" : "NAO CONFIGURADA"));
+  console.log("Chave Anthropic: " + (CHAVE ? "OK" : "NAO CONFIGURADA"));
+  console.log("Google Sheet ID: " + (process.env.GOOGLE_SHEET_ID ? "OK" : "NAO CONFIGURADO"));
+  console.log("Google Service Account: " + (process.env.GOOGLE_SERVICE_ACCOUNT ? "OK" : "NAO CONFIGURADO"));
 });
