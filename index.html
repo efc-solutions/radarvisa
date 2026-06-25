@@ -529,7 +529,7 @@ function baixarExcel(){
     var cabecalho = [
       'Data DOU','Mês','Ano','Categoria','Tipo de Ato',
       'Tipo Processo','Com/Sem Exigência','Empresa','Produto',
-      'Nº Processo','Nº Registro','Dias de Análise','Desconsiderar?','Observação'
+      'Nº Processo','Nº Registro','Data de Protocolo','Dias de Análise','Desconsiderar?','Observação'
     ];
 
     var MESES = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho',
@@ -561,6 +561,7 @@ function baixarExcel(){
         p.titulo  || '',
         p.numero_processo || p.processo || '',
         p.numero_registro || p.registro || '',
+        p.data_protocolo  || '',
         p.dias_analise != null ? p.dias_analise : '',
         'Não',
         ''
@@ -710,6 +711,7 @@ function renderLista(){
       +(r.empresa?'<div class="card-empresa">🏢 '+esc(r.empresa)+(r.cnpj?' · '+esc(r.cnpj):'')+'</div>':'')
       +(r.categoria?'<div style="font-size:11px;color:var(--gray-500);margin-bottom:4px">📦 '+esc(r.categoria)+(r.codigo?' · Código '+esc(r.codigo):'')+'</div>':'')
       +(r.processo?'<div style="font-size:11px;color:var(--gray-400);margin-bottom:4px;font-family:monospace">'+esc(r.processo)+'</div>':'')
+      +(r.dias_analise?'<div style="font-size:11px;color:#166534;font-weight:600;margin-bottom:4px">⏱️ '+r.dias_analise+' dias de análise</div>':'')
       +(res?'<div class="card-resumo">'+esc(res)+'</div>':'')
       +'<div class="card-meta"><span>📅 '+r.data+'</span><span>DO1</span></div>'
       +'</div>'

@@ -702,12 +702,15 @@ const server = http.createServer(function(req, res) {
                 var resultado = JSON.parse(jsonStr);
 
                 // Adicionar data a cada processo
-                (resultado.processos || []).forEach(function(p) {
-                  p.data = dataDOU;
-                });
+                var processos = resultado.processos || [];
+                processos.forEach(function(p) { p.data = dataDOU; });
 
-                res.writeHead(200, {"Content-Type":"application/json"});
-                res.end(JSON.stringify(resultado));
+                // Consultar ANVISA para preencher dias_analise automaticamente
+                consultarDiasANVISA(processos, dataDOU, function(processosComDias) {
+                  resultado.processos = processosComDias;
+                  res.writeHead(200, {"Content-Type":"application/json"});
+                  res.end(JSON.stringify(resultado));
+                });
               } catch(e) {
                 console.error("Erro ao parsear resposta Claude:", e.message);
                 res.writeHead(500, {"Content-Type":"application/json"});
@@ -756,6 +759,133 @@ function inferirTipoProcesso(tipoAto) {
 function inferirExigencia(tipoAto, tipoProc) {
   if (tipoProc !== "Registro Novo") return ""; // só se aplica a Registro Novo
   return ""; // não é possível inferir sem dados do DOU — campo fica em branco para preenchimento manual se necessário
+}
+
+// ── Consulta ANVISA: preencher Data de Protocolo e Dias de Análise ──
+function consultarProcessoANVISA(numeroProcesso, callback) {
+  // Formatar número do processo para a API: remover pontos, barras e traços
+  // Ex: "25351.185292/2025-59" → "25351185292202559"
+  var numLimpo = (numeroProcesso || "").replace(/[\.\-\/]/g, "");
+  if (!numLimpo || numLimpo.length < 10) return callback(null, null);
+
+  var path = "/api/consulta/cosmeticos/registrados/?count=1&filter%5BnumeroProcesso%5D=" +
+             encodeURIComponent(numeroProcesso);
+
+  var opts = {
+    hostname: "consultas.anvisa.gov.br",
+    path: path,
+    method: "GET",
+    headers: {
+      "Accept": "application/json",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "Origin": "https://consultas.anvisa.gov.br",
+      "Referer": "https://consultas.anvisa.gov.br/"
+    }
+  };
+
+  var req = https.request(opts, function(apiRes) {
+    var data = "";
+    apiRes.on("data", function(c) { data += c; });
+    apiRes.on("end", function() {
+      try {
+        var json = JSON.parse(data);
+        var content = json.content || [];
+        if (content.length === 0) return callback(null, null);
+
+        var item = content[0];
+        // A API retorna dataProtocolo no formato "dd/MM/yyyy" ou "yyyy-MM-dd"
+        var dataProtocolo = item.dataProtocolo || item.dataAbertura || item.dataEntrada || null;
+        callback(null, { dataProtocolo: dataProtocolo, situacao: item.situacaoRegistro || "" });
+      } catch(e) {
+        callback(null, null);
+      }
+    });
+  });
+
+  req.on("error", function() { callback(null, null); });
+  req.setTimeout(8000, function() { req.destroy(); callback(null, null); });
+  req.end();
+}
+
+function calcularDias(dataProtocolo, dataDOU) {
+  try {
+    // dataProtocolo pode vir como "dd/MM/yyyy" ou "yyyy-MM-dd"
+    var dtProt, dtDOU;
+
+    if (dataProtocolo && dataProtocolo.includes("/")) {
+      var p = dataProtocolo.split("/");
+      if (p[0].length === 4) {
+        // yyyy/MM/dd
+        dtProt = new Date(parseInt(p[0]), parseInt(p[1])-1, parseInt(p[2]));
+      } else {
+        // dd/MM/yyyy
+        dtProt = new Date(parseInt(p[2]), parseInt(p[1])-1, parseInt(p[0]));
+      }
+    } else if (dataProtocolo && dataProtocolo.includes("-")) {
+      var p2 = dataProtocolo.split("-");
+      dtProt = new Date(parseInt(p2[0]), parseInt(p2[1])-1, parseInt(p2[2]));
+    } else {
+      return null;
+    }
+
+    // dataDOU no formato "dd/MM/yyyy"
+    if (dataDOU && dataDOU.includes("/")) {
+      var d = dataDOU.split("/");
+      dtDOU = new Date(parseInt(d[2]), parseInt(d[1])-1, parseInt(d[0]));
+    } else {
+      return null;
+    }
+
+    if (isNaN(dtProt.getTime()) || isNaN(dtDOU.getTime())) return null;
+
+    var diffMs = dtDOU.getTime() - dtProt.getTime();
+    var diffDias = Math.round(diffMs / (1000 * 60 * 60 * 24));
+    return diffDias >= 0 ? diffDias : null;
+  } catch(e) {
+    return null;
+  }
+}
+
+function consultarDiasANVISA(processos, dataDOU, callback) {
+  if (!processos || processos.length === 0) return callback([]);
+
+  var resultado = processos.slice(); // cópia
+  var pendentes = 0;
+
+  resultado.forEach(function(p) {
+    // Só consultar se tiver número de processo e ainda não tiver dias
+    if (!p.numero_processo || p.dias_analise) return;
+    pendentes++;
+  });
+
+  if (pendentes === 0) return callback(resultado);
+
+  var concluidos = 0;
+
+  resultado.forEach(function(p, idx) {
+    if (!p.numero_processo || p.dias_analise) return;
+
+    // Pequeno delay entre consultas para não sobrecarregar a ANVISA
+    setTimeout(function() {
+      consultarProcessoANVISA(p.numero_processo, function(err, dados) {
+        if (dados && dados.dataProtocolo) {
+          var dias = calcularDias(dados.dataProtocolo, p.data || dataDOU);
+          if (dias !== null) {
+            resultado[idx].dias_analise = dias;
+            resultado[idx].data_protocolo = dados.dataProtocolo;
+            console.log("✅ " + p.numero_processo + " → " + dias + " dias (prot: " + dados.dataProtocolo + ")");
+          }
+        } else {
+          console.log("⚠️  " + p.numero_processo + " → sem data protocolo na ANVISA");
+        }
+
+        concluidos++;
+        if (concluidos >= pendentes) {
+          callback(resultado);
+        }
+      });
+    }, idx * 300); // 300ms entre cada consulta
+  });
 }
 
 server.listen(PORT, "0.0.0.0", function() {
